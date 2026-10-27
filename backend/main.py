@@ -1,12 +1,11 @@
 # Wind forecast decision-time app (backend). Constants first, no env vars.
-import threading
-import requests
+import asyncio
+import httpx
 import numpy as np
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -20,14 +19,17 @@ LAST_DAY = FIRST_DAY + timedelta(days=N_DAYS - 1)
 DIST = Path(__file__).parent.parent / "frontend" / "dist"  # built React app
 
 
-def get(endpoint, params):
+HTTP = httpx.AsyncClient(timeout=30)
+
+
+async def get(endpoint, params):
     """Call the Elexon API (30s timeout, one retry). Returns a list of rows."""
     for attempt in range(2):
         try:
-            r = requests.get(f"{BASE}/{endpoint}", params=params, timeout=30)
+            r = await HTTP.get(f"{BASE}/{endpoint}", params=params)
             r.raise_for_status()
             return r.json()
-        except requests.RequestException:
+        except httpx.HTTPError:
             if attempt == 1:
                 raise  # second failure: let the caller skip this day
 
@@ -55,19 +57,21 @@ def pick_forecast(rows, cutoff):
     return best
 
 
-def load_day(d):
+async def load_day(d):
     """Hourly rows for delivery day d: forecast known at 09:00 London on D-1 vs actual."""
     if d in CACHE:
         return CACHE[d]
     cutoff = datetime.combine(d - timedelta(days=1), time(CUTOFF_HOUR), LONDON).astimezone(timezone.utc)
     day_start = datetime.combine(d, time(0), LONDON).astimezone(timezone.utc)
     # Actuals for D-1 and D (D-1 is only needed for the persistence baseline)
-    act = get("FUELHH/stream", {"settlementDateFrom": str(d - timedelta(days=1)),
-                                "settlementDateTo": str(d), "fuelType": "WIND"})
-    # Forecasts published from cutoff-48h until the delivery day starts (the part after
-    # the cutoff is used ONLY for the look-ahead comparison, never for the decision)
-    fc = get("WINDFOR/stream", {"publishDateTimeFrom": iso(cutoff - timedelta(hours=48)),
-                                "publishDateTimeTo": iso(day_start)})
+    act, fc = await asyncio.gather(
+        get("FUELHH/stream", {"settlementDateFrom": str(d - timedelta(days=1)),
+                              "settlementDateTo": str(d), "fuelType": "WIND"}),
+        # Forecasts published from cutoff-48h until the delivery day starts (the part after
+        # the cutoff is used ONLY for the look-ahead comparison, never for the decision)
+        get("WINDFOR/stream", {"publishDateTimeFrom": iso(cutoff - timedelta(hours=48)),
+                               "publishDateTimeTo": iso(day_start)}),
+    )
     fc = [r for r in fc if r["startTime"].startswith(str(d))]  # targets on day D (UTC date = UK date in January)
     decision = pick_forecast(fc, cutoff)      # what the trader could see at 09:00 on D-1
     latest = pick_forecast(fc, day_start)     # latest forecast before delivery starts (look-ahead)
@@ -84,18 +88,17 @@ def load_day(d):
     return rows
 
 
-def load_all():
+async def load_all():
     """Load all delivery days in parallel. Returns (rows, list of days that failed)."""
     days = [FIRST_DAY + timedelta(i) for i in range(N_DAYS)]
 
-    def safe(d):
+    async def safe(d):
         try:
-            return load_day(d)
+            return await load_day(d)
         except Exception:
             return None  # day skipped and reported, nothing invented
 
-    with ThreadPoolExecutor(8) as ex:
-        results = list(ex.map(safe, days))
+    results = await asyncio.gather(*[safe(d) for d in days])
     failed = [str(d) for d, r in zip(days, results) if r is None]
     return [r for x in results if x for r in x], failed
 
@@ -163,21 +166,21 @@ def analyze(rows):
 # ---------------- API ----------------
 @asynccontextmanager
 async def lifespan(app):
-    threading.Thread(target=load_all, daemon=True).start()  # warm the cache in the background
+    asyncio.create_task(load_all())  # warm the cache in the background
     yield
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def all_data():
+async def all_data():
     """All rows that have both forecast and actual, plus the days that failed to load."""
-    rows, failed = load_all()  # days already cached return instantly
+    rows, failed = await load_all()  # days already cached return instantly
     return [r for r in rows if r["actual"] is not None], failed
 
 
 @app.get("/api/forecast")
-def forecast(date: str):
+async def forecast(date: str):
     """Decision-time forecast vs actual for one delivery day, with a P10/P90 error band."""
     try:
         d = datetime.strptime(date, "%Y-%m-%d").date()
@@ -186,10 +189,10 @@ def forecast(date: str):
     if not FIRST_DAY <= d <= LAST_DAY:
         raise HTTPException(400, f"date must be between {FIRST_DAY} and {LAST_DAY}")
     try:
-        day = load_day(d)
+        day = await load_day(d)
     except Exception:
         raise HTTPException(503, f"Elexon data for {d} could not be loaded")
-    rows, _ = all_data()
+    rows, _ = await all_data()
     if not rows:
         raise HTTPException(503, "No data loaded, cannot compute the error band")
     s = stats(rows)  # band = forecast + P10 / P90 of historical signed error (actual - forecast)
@@ -199,9 +202,9 @@ def forecast(date: str):
 
 
 @app.get("/api/metrics")
-def metrics():
+async def metrics():
     """Every accuracy number from the analysis, plus histogram and missing-data report."""
-    rows, failed = all_data()
+    rows, failed = await all_data()
     if not rows:
         raise HTTPException(503, "No data loaded")
     counts, edges = np.histogram([r["actual"] - r["forecast"] for r in rows], bins=20)
