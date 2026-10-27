@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://my-fastapi-backend-fjui.onrender.com/api/:path*"
+    }
+  ]
+}
